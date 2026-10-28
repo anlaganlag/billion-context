@@ -178,6 +178,14 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
     // level like openBlocks so a re-fetched stream can discard the dead
     // attempt's still-held entries at resume.
     const heldThinkingStarts = new Map<number, string>();
+    // #2501 extended: payload events (non-empty thinking_delta) buffered while
+    // their block is held — keyed by upstreamIndex, flushed (as reasoning events
+    // carrying raw, AFTER the held start) when the signature_delta, block stop,
+    // or message_stop finally arrives. A truncation before the signature
+    // therefore leaves NOTHING on the client wire, keeping the #413 blind
+    // re-fetch zero-side-effect even when GLM-style upstreams stream thinking
+    // deltas then self-sever mid-block.
+    const heldThinkingEvents = new Map<number, { event: string; text: string }[]>();
 
     const removeOpenBlock = (index: number): void => {
         const i = openBlocks.indexOf(index);
@@ -369,6 +377,7 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
             // invisible to the client by construction — discard them outright instead
             // of closing them (closing would surface a block the client never saw).
             heldThinkingStarts.clear();
+            heldThinkingEvents.clear();
             for (const index of openBlocks.splice(0)) {
                 yield {
                     kind: "meta",
@@ -390,6 +399,27 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                 openBlocks.push(ci);
                 return remapIndexInEvent(held, ci);
             };
+
+            // #2501 extended: flush a still-held thinking block — emit the held
+            // start (allocating the client index), then every buffered payload
+            // delta as a reasoning event CARRYING RAW (remapped to it). Raw is
+            // load-bearing on every round: round 1 forwards the raw bytes as-is,
+            // and on rounds > 1 core.ts would otherwise re-wrap each raw-less
+            // delta via emitReasoning (per-delta fragments — the zcode duplicate
+            // thinking regression). Buffering + releasing here keeps wire order
+            // start → deltas → signature legal. Triggered by the signature_delta,
+            // by content_block_stop (never-signing relay), or by message_stop
+            // (malformed tail). Yields nothing when the block isn't held.
+            async function* flushHeldThinking(upstreamIndex: number, round: number): AsyncGenerator<ParsedStreamEvent> {
+                const startBuf = releaseHeldThinking(upstreamIndex);
+                if (startBuf === null) return;
+                yield { kind: "meta", chunk: startBuf, firstRoundOnly: round === 1, thinkingStart: true } as ParsedStreamEvent;
+                const ci = indexMap.get(upstreamIndex) ?? upstreamIndex;
+                for (const e of heldThinkingEvents.get(upstreamIndex) ?? []) {
+                    yield { kind: "reasoning", delta: e.text, raw: remapIndexInEvent(e.event, ci) } as ParsedStreamEvent;
+                }
+                heldThinkingEvents.delete(upstreamIndex);
+            }
 
             for await (const eventStr of iterSseEvents(upstream)) {
                 const parsed = parseAnthropicSse(eventStr);
@@ -439,21 +469,22 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                         const id = typeof block.id === "string" ? block.id : `toolu_${upstreamIndex}`;
                         pending.set(upstreamIndex, { id, name, json: "" });
                     } else if (block.type === "thinking") {
-                        // #2501: HOLD the start frame until the first payload-bearing
-                        // delta (non-empty thinking_delta or signature_delta). A
-                        // signing upstream signs every thinking block; one whose
-                        // forward started but never got its signature_delta is INVALID
-                        // in the client's persisted history — the next replay is
-                        // rejected ("thinking.signature: Field required") and Claude
-                        // Code then strips ALL prior thinking from the session forever.
-                        // Holding keeps a pre-signature truncation invisible to the
-                        // client, so the #413 blind re-fetch stays zero-side-effect.
-                        // Opus 5.5 sends nothing — or only EMPTY thinking_deltas —
-                        // between start and signature_delta; those empties are dropped
-                        // while held (delta branch below), otherwise they reach the
-                        // client ahead of their own start frame ("Content block not
-                        // found" → non-streaming fallback). redacted_thinking is NOT
-                        // held: it arrives whole in this frame and needs no signature.
+                        // #2501 extended: HOLD the start frame until the block's
+                        // signature_delta. A signing upstream signs every thinking
+                        // block; one whose forward started but never got its
+                        // signature_delta is INVALID in the client's persisted history
+                        // — the next replay is rejected ("thinking.signature: Field
+                        // required") and Claude Code then strips ALL prior thinking
+                        // from the session forever. Holding start AND all payload
+                        // deltas (see heldThinkingEvents) keeps a pre-signature
+                        // truncation invisible to the client, so the #413 blind
+                        // re-fetch stays zero-side-effect. Opus 5.5 sends nothing —
+                        // or only EMPTY thinking_deltas — between start and
+                        // signature_delta; those empties are dropped while held
+                        // (delta branch below), otherwise they reach the client ahead
+                        // of their own start frame ("Content block not found" →
+                        // non-streaming fallback). redacted_thinking is NOT held: it
+                        // arrives whole in this frame and needs no signature.
                         thinkingIndexes.add(upstreamIndex);
                         sawThinking = true;
                         heldThinkingStarts.set(upstreamIndex, eventStr);
@@ -486,7 +517,18 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                             yield { kind: "text", delta: clean, raw } as ParsedStreamEvent;
                         }
                     } else if (delta.type === "thinking_delta" && typeof delta.thinking === "string") {
-                        if (delta.thinking.length > 0) {
+                        if (delta.thinking.length > 0 && heldThinkingStarts.has(upstreamIndex)) {
+                            // #2501 extended: the block is still held — buffer the payload
+                            // event and yield NOTHING: no wire bytes (pre-signature
+                            // truncation stays invisible → #413 blind re-fetch keeps its
+                            // zero-side-effect guarantee), and no raw-less reasoning event
+                            // (that would make core.ts re-wrap each delta via emitReasoning
+                            // on rounds > 1 — per-delta fragments). Accumulation happens at
+                            // flush time, where deltas carry raw.
+                            const held = heldThinkingEvents.get(upstreamIndex);
+                            if (held) held.push({ event: eventStr, text: delta.thinking });
+                            else heldThinkingEvents.set(upstreamIndex, [{ event: eventStr, text: delta.thinking }]);
+                        } else if (delta.thinking.length > 0) {
                             // #1960: thinking is a SIGNED payload — Anthropic verifies it
                             // byte-for-byte when the latest assistant message is replayed
                             // ("thinking blocks ... cannot be modified"), and Gemini's
@@ -521,13 +563,10 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                             }
                         }
                     } else if (delta.type === "signature_delta" && typeof delta.signature === "string") {
-                        // #2501: a signature is payload-bearing — release the held start
-                        // first (Opus 5.5 sends ONLY this between start and stop).
-                        const startBuf = releaseHeldThinking(upstreamIndex);
+                        // #2501 extended: a signature is payload-bearing — flush the held
+                        // block (start, then every buffered payload delta) before it.
+                        yield* flushHeldThinking(upstreamIndex, round);
                         const ci = indexMap.get(upstreamIndex) ?? upstreamIndex;
-                        if (startBuf) {
-                            yield { kind: "meta", chunk: startBuf, firstRoundOnly: round === 1, thinkingStart: true } as ParsedStreamEvent;
-                        }
                         yield {
                             kind: "reasoning",
                             delta: "",
@@ -552,12 +591,12 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                             arguments: tb.json,
                         } as ParsedStreamEvent;
                     } else if (thinkingIndexes.delete(upstreamIndex)) {
-                        // #2501: the block never released (stop before any payload-bearing
-                        // delta) — the client saw none of it, so neither the start nor this
-                        // stop may surface: a signature-less thinking block in the client's
-                        // history is the exact poison #2501 fixes. Discard silently.
-                        // (Map.delete returns a BOOLEAN — true iff an entry was removed.)
-                        if (heldThinkingStarts.delete(upstreamIndex)) continue;
+                        // #2501 extended: the block is STILL held (stop before its
+                        // signature_delta — never-signing relay) — flush it now: start,
+                        // then every buffered payload delta, then this stop. T3 semantics
+                        // kept (unsigned thinking still displays), only delayed to the
+                        // block tail. Already-released blocks flush nothing here.
+                        yield* flushHeldThinking(upstreamIndex, round);
                         // Seal the current thinking segment so interleaved thinking
                         // blocks each keep their own signature on rebuild.
                         // #1960: a redacted block has no captured reasoning — replay its
@@ -635,6 +674,20 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                     maybeSummarizeStrips();
                     yield { kind: "done", finishReason: stopReason, thinking: sawThinking, ...(deltaExtras ? { terminalExtra: deltaExtras } : {}) } as ParsedStreamEvent;
                 } else if (type === "message_stop") {
+                    // #2501 extended: a held block surviving to message_stop is a
+                    // malformed tail — flush it (payload delivered beats silent drop)
+                    // and close it so the wire stays order-legal before message_stop.
+                    for (const idx of [...heldThinkingStarts.keys()]) {
+                        yield* flushHeldThinking(idx, round);
+                        const ci = indexMap.get(idx) ?? idx;
+                        removeOpenBlock(ci);
+                        yield {
+                            kind: "meta",
+                            chunk: Buffer.from(`event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: ci })}\n\n`, "utf8"),
+                            firstRoundOnly: false,
+                        } as ParsedStreamEvent;
+                        yield { kind: "reasoning", delta: "", blockEnd: true } as ParsedStreamEvent;
+                    }
                     if (lastTextIndex !== null) {
                         const tail = tagFilter.flush();
                         if (tail.length > 0) {

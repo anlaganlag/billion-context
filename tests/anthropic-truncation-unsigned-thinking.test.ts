@@ -15,15 +15,16 @@ import { buildCompressSystemPrompt } from "../src/compress-tool.ts";
 // prior thinking from the session permanently ({"type":"thinking_stripped",
 // "scope":"all"}) plus a cache break at the strip moment.
 //
-// Fix pinned here (host-only): (1) the adapter HOLDS each thinking start
-// until the first payload-bearing delta (non-empty thinking_delta or
-// signature_delta), so a pre-signature truncation is truly invisible to the
-// client and the blind re-fetch stays zero-side-effect; (2) when a thinking
-// block DID reach the client without its signature AND the upstream signs
-// (history or in-attempt evidence), BOTH re-fetch shapes are refused and the
-// truncation ends as a client-visible error, so the client discards the whole
-// attempt instead of persisting the poisoned block. Never-signing relays keep
-// the #1455 behavior (T3).
+// Fix pinned here (host-only): (1) the adapter HOLDS each thinking block —
+// start AND all payload deltas — until its signature_delta (flush also at
+// content_block_stop / message_stop, so never-signing relays keep T3 display
+// semantics, only delayed to the block tail). A pre-signature truncation
+// therefore leaves NOTHING on the wire and the blind re-fetch stays
+// zero-side-effect even for GLM-style upstreams that stream thinking then
+// self-sever; (2) when an UNSIGNED thinking block DID reach the client AND
+// the upstream signs (history or in-attempt evidence), BOTH re-fetch shapes
+// are refused and the truncation ends as a client-visible error (T7), so the
+// client discards the whole attempt instead of persisting the poisoned block.
 
 const UNSIGNED_BODY = { model: "claude", messages: [], stream: true, max_tokens: 10 };
 // History-side evidence that the upstream signs: the client replays its
@@ -206,31 +207,39 @@ test("#2501 T1: signature-only thinking truncated before its signature — invis
     assert.equal((out.match(/event: message_start/g) ?? []).length, 1, "single response identity across the stitched stream");
 });
 
-test("#2501 T2: forwarded unsigned thinking on a signing upstream (history evidence) — re-fetch refused, error end, all blocks closed", async () => {
+test("#2501 T2: payload thinking_delta buffered while held — pre-signature truncation invisible, blind re-fetch recovers (signed upstream)", async () => {
     const attempt1 = [MESSAGE_START, thinkingStart(0), thinkingDelta(0, "let me think")].join("");
-    const attempt2 = [textBlock(0, "must never arrive"), MESSAGE_DELTA(), MESSAGE_STOP].join("");
+    const attempt2 = [MESSAGE_START, thinkingStart(0), thinkingDelta(0, "let me think"), signatureDelta(0, "sig_abc"), blockStop(0), textBlock(1, "recovered"), MESSAGE_DELTA(), MESSAGE_STOP].join("");
     const { out, calls } = await drainAnthropic(attempt1, [attempt2], "i2501-t2", SIGNED_HISTORY_BODY);
-    assert.equal(calls, 0, "no re-fetch — an unsigned block on the client wire can never be made valid by one");
-    assert.ok(!out.includes("must never arrive"), "the refused re-fetch's response never reached the client");
-    assert.ok(out.includes("upstream stream truncated"), "truncation surfaced as the client-visible error");
+    assert.equal(calls, 1, "held thinking never touched the wire — the blind re-fetch stays zero-side-effect");
+    assert.ok(out.includes("recovered"), "retried content reached the client");
+    assert.ok(!out.includes("upstream stream truncated"), "self-healed: no error surfaced");
     assertBlockOrderLegal(out);
-    const events = parseSse(out);
-    assert.equal(events[events.length - 1].type, "error", "last event is the protocol-native error");
-    assert.doesNotMatch(out, /event: message_(stop|delta)/, "no completion frame riding along with the failure");
+    assertNoUnsignedThinkingBlock(out);
+    assert.equal((out.match(/event: content_block_start/g) ?? []).length, 2, "only the retry's blocks (thinking + text) reached the client — the dead attempt's held block was never forwarded");
+    assert.equal((out.match(/event: message_start/g) ?? []).length, 1, "single response identity across the stitched stream");
 });
 
-test("#2501 T3: never-signing relay (no evidence anywhere) — #1455 re-fetch behavior retained", async () => {
+test("#2501 T3: never-signing relay truncation — held block fully discarded, retry blocks start at index 0", async () => {
     const attempt1 = [MESSAGE_START, thinkingStart(0), thinkingDelta(0, "let me think")].join("");
-    const attempt2 = [textBlock(0, "recovered"), MESSAGE_DELTA(), MESSAGE_STOP].join("");
+    const attempt2 = [MESSAGE_START, thinkingStart(0), thinkingDelta(0, "let me think"), signatureDelta(0, "sig_z"), blockStop(0), textBlock(1, "recovered"), MESSAGE_DELTA(), MESSAGE_STOP].join("");
     const { out, calls } = await drainAnthropic(attempt1, [attempt2], "i2501-t3", UNSIGNED_BODY);
     assert.equal(calls, 1, "unsigned relay: the blind re-fetch still self-heals (#1455)");
     assert.ok(out.includes("recovered"), "retried content reached the client");
     assert.ok(!out.includes("upstream stream truncated"), "self-healed: no error surfaced");
     assertBlockOrderLegal(out);
-    assert.ok(
-        out.indexOf("\"type\":\"content_block_stop\",\"index\":0") < out.indexOf("\"type\":\"content_block_start\",\"index\":1"),
-        "the dead attempt's dangling thinking block is closed BEFORE the retry's blocks continue at higher indices",
-    );
+    assert.equal((out.match(/event: content_block_start/g) ?? []).length, 2, "held dead attempt fully discarded — retry's thinking + text are the only blocks");
+    assert.equal((out.match(/event: content_block_stop/g) ?? []).length, 2, "no dangling close synthesized for the discarded attempt");
+});
+
+test("#2501 T3b: never-signing relay, stop before signature — held block flushes at stop, thinking still displayed (T3 semantics, delayed)", async () => {
+    const round = [MESSAGE_START, thinkingStart(0), thinkingDelta(0, "visible now"), blockStop(0), textBlock(1, "done"), MESSAGE_DELTA(), MESSAGE_STOP].join("");
+    const { out, calls } = await drainAnthropic(round, [], "i2501-t3b", UNSIGNED_BODY);
+    assert.equal(calls, 0, "clean stream — no retry involved");
+    assertBlockOrderLegal(out);
+    assert.ok(out.includes("visible now"), "held payload flushed at the block stop — unsigned thinking still displays");
+    const types = parseSse(out).filter((e) => e.type === "content_block_start").map((e) => ((e.data.content_block ?? {}) as Record<string, unknown>).type);
+    assert.deepEqual(types, ["thinking", "text"], "flushed thinking block precedes the text block");
 });
 
 test("#2501 T4: empty thinking_deltas before any release — event order stays legal (a naive non-empty-only hold would fail this)", async () => {
@@ -256,16 +265,44 @@ test("#2501 T4: empty thinking_deltas before any release — event order stays l
     assert.ok(firstStart > -1 && firstDelta > -1 && firstStart < firstDelta, "the held start must be released before ANY delta reaches the client");
 });
 
-test("#2501 T5: visible text THEN unsigned thinking truncation — the CONTINUATION re-fetch is refused too", async () => {
+test("#2501 T5: visible text THEN held thinking truncation — the CONTINUATION re-fetch proceeds (wire has no unsigned block)", async () => {
     const attempt1 = [MESSAGE_START, textStart(0), textDelta(0, "partial answer "), thinkingStart(1), thinkingDelta(1, "hmm")].join("");
-    const attempt2 = [textBlock(0, "must never arrive"), MESSAGE_DELTA(), MESSAGE_STOP].join("");
+    const attempt2 = [MESSAGE_START, textStart(0), textDelta(0, "continuing"), MESSAGE_DELTA(), MESSAGE_STOP].join("");
     const { out, calls } = await drainAnthropic(attempt1, [attempt2], "i2501-t5", SIGNED_HISTORY_BODY);
-    assert.equal(calls, 0, "continuation re-fetch refused — same poisoned-block hazard");
-    assert.ok(!out.includes("must never arrive"), "the refused re-fetch's response never reached the client");
+    assert.equal(calls, 1, "held thinking is wire-invisible — the continuation re-fetch is allowed");
     assert.ok(out.includes("partial answer"), "already-forwarded text preserved");
+    assert.ok(out.includes("continuing"), "continuation content reached the client");
+    assert.ok(!out.includes("upstream stream truncated"), "self-healed: no error surfaced");
+    assertBlockOrderLegal(out);
+    assertNoUnsignedThinkingBlock(out);
+});
+
+test("#2501 T6: interleaved multi-block thinking — each block held/flushed independently, client indices contiguous", async () => {
+    const round = [
+        MESSAGE_START,
+        thinkingStart(0), thinkingDelta(0, "thought one"), signatureDelta(0, "sig_1"), blockStop(0),
+        textBlock(1, "middle"),
+        thinkingStart(2), thinkingDelta(2, "thought two"), signatureDelta(2, "sig_2"), blockStop(2),
+        textBlock(3, "after"),
+        MESSAGE_DELTA(),
+        MESSAGE_STOP,
+    ].join("");
+    const { out, calls } = await drainAnthropic(round, [], "i2501-t6", SIGNED_HISTORY_BODY);
+    assert.equal(calls, 0, "clean stream — no retry involved");
+    assertBlockOrderLegal(out);
+    assertNoUnsignedThinkingBlock(out);
+    assert.ok(out.includes("thought one") && out.includes("thought two"), "both buffered payloads flushed with their own blocks");
+    const starts = parseSse(out).filter((e) => e.type === "content_block_start").map((e) => e.data.index as number);
+    assert.deepEqual(starts, [0, 1, 2, 3], "four client blocks, indices contiguous in arrival order");
+});
+
+test("#2501 T7: unsigned block flushed at stop on a signing upstream — #2501 refusal intact (no regression)", async () => {
+    const attempt1 = [MESSAGE_START, thinkingStart(0), thinkingDelta(0, "hmm"), blockStop(0), textStart(1), textDelta(1, "partial")].join("");
+    const attempt2 = [textBlock(0, "must never arrive"), MESSAGE_DELTA(), MESSAGE_STOP].join("");
+    const { out, calls } = await drainAnthropic(attempt1, [attempt2], "i2501-t7", SIGNED_HISTORY_BODY);
+    assert.equal(calls, 0, "stop-flushed unsigned block bars the continuation re-fetch — #2501 refusal preserved");
+    assert.ok(!out.includes("must never arrive"), "the refused re-fetch's response never reached the client");
+    assert.ok(out.includes("partial"), "already-forwarded text preserved");
     assert.ok(out.includes("upstream stream truncated"), "truncation surfaced as the client-visible error");
     assertBlockOrderLegal(out);
-    const events = parseSse(out);
-    assert.equal(events[events.length - 1].type, "error", "last event is the protocol-native error");
-    assert.doesNotMatch(out, /event: message_(stop|delta)/, "no completion frame riding along with the failure");
 });

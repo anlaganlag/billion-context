@@ -155,11 +155,8 @@ test("#1455 A2: reasoning-only truncation on round 1 no longer locks the blind r
     assert.equal(blocks.filter((b) => b.startsWith("event: message_start")).length, 1, "exactly one message_start — the retry's start frame must be suppressed by forwarding state, not round number");
     const starts = (out.match(/event: content_block_start/g) ?? []).length;
     const stops = (out.match(/event: content_block_stop/g) ?? []).length;
-    assert.equal(stops, starts, "every opened block is closed, including the dead attempt's dangling thinking block");
-    assert.ok(
-        out.indexOf('"type":"content_block_stop","index":0') < out.indexOf('"type":"content_block_start","index":1'),
-        "dangling thinking block closed BEFORE the retry's blocks continue at higher indices",
-    );
+    assert.equal(stops, starts, "every opened block is closed");
+    assert.equal(starts, 1, "#2501 extended: the dead attempt's held thinking block is fully discarded — only the retry's text block reaches the client");
 });
 
 test("#1455 B2: exhausted reasoning-only retries terminate on the protocol-native error channel with all blocks closed", async () => {
